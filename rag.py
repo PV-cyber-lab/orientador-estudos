@@ -1,6 +1,7 @@
 """
 Núcleo do RAG: leitura dos documentos, chunking, embeddings e banco vetorial (ChromaDB).
 """
+import re
 import os
 import sys
 import hashlib
@@ -60,6 +61,36 @@ def quebrar_em_chunks(texto, tamanho=1200, sobreposicao=200):
         inicio = fim - sobreposicao
     return [c for c in chunks if len(c) > 50]
 
+def chunks_por_disciplina(paginas):
+    """Cria 1 chunk por disciplina (ementa + bibliografia juntas).
+    Páginas antes da primeira disciplina usam o chunking por tamanho."""
+    texto, inicios = "", []
+    for pagina, t in paginas:
+        inicios.append((len(texto), pagina))
+        texto += (t or "") + "\n"
+
+    def pagina_de(pos):
+        return max(pg for ini, pg in inicios if ini <= pos)
+
+    blocos = []
+    marcas = [m.start() for m in re.finditer(r"Disciplina:\s*", texto)] + [len(texto)]
+    for ini, fim in zip(marcas, marcas[1:]):
+        bloco = texto[ini:fim]
+        corte = re.search(r"_{5,}", bloco)          # linha "_____" que separa disciplinas
+        if corte:
+            bloco = bloco[:corte.start()]
+        obs = re.search(r"Observações:[^\n]*", bloco)  # cada disciplina termina em "Observações"
+        if obs:
+            bloco = bloco[:obs.end()]
+        if "Ementa" in bloco and "Bibliografia" in bloco:
+            blocos.append((pagina_de(ini), " ".join(bloco.split())))
+
+    if not blocos:  # documento sem disciplinas: usa o método antigo
+        return [(p, c) for p, t in paginas for c in quebrar_em_chunks(t)]
+
+    primeira = min(p for p, _ in blocos)
+    intro = [(p, c) for p, t in paginas if p < primeira for c in quebrar_em_chunks(t)]
+    return intro + blocos
 
 # ----------------------------------------------------------------------
 # Banco vetorial
@@ -80,11 +111,10 @@ class BaseVetorial:
     def indexar_arquivo(self, caminho, nome=None):
         nome = nome or Path(caminho).name
         docs, metas, ids = [], [], []
-        for pagina, texto in ler_documento(caminho):
-            for j, chunk in enumerate(quebrar_em_chunks(texto)):
-                docs.append(chunk)
-                metas.append({"fonte": nome, "pagina": pagina})
-                ids.append(hashlib.md5(f"{nome}|{pagina}|{j}|{chunk[:50]}".encode()).hexdigest())
+        for j, (pagina, chunk) in enumerate(chunks_por_disciplina(ler_documento(caminho))):
+            docs.append(chunk)
+            metas.append({"fonte": nome, "pagina": pagina})
+            ids.append(hashlib.md5(f"{nome}|{pagina}|{j}|{chunk[:50]}".encode()).hexdigest())
         for i in range(0, len(docs), 64):  # em lotes
             self.colecao.upsert(ids=ids[i:i + 64], documents=docs[i:i + 64],
                                 metadatas=metas[i:i + 64], embeddings=self.embedder(docs[i:i + 64]))
